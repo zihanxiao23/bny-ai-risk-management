@@ -1,5 +1,6 @@
 import hashlib
 import re
+import csv
 from datetime import datetime
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from abc import ABC, abstractmethod
@@ -45,6 +46,19 @@ class BaseScraper(ABC):
             print(f"!! [DATABASE ERROR] Failed to save {self.__class__.__name__} batch: {e}")
         
         return self
+    
+    def save_csv(self,file_name):
+        try:
+            headers = self.batch[0].keys()
+            
+            with open(file_name, mode='a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(self.batch)
+                
+            print(f"!! [FALLBACK] Data safely backed up to: {file_name}")
+        except Exception as e:
+            print(f"!!! [CRITICAL] Failed to save CSV fallback: {e}")
     @abstractmethod
     def fetch(self):
         pass
