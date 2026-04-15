@@ -65,10 +65,10 @@ if __name__ == "__main__":
 
     # # Date range configuration
     START_DATE = datetime(2025, 4, 2) # to 4/10
-    df = pd.read_csv(f'data/gnews/{START_DATE.strftime('%Y-%m-%d')}.csv')
+    df = pd.read_csv(f'data/dxy_condensed.csv')
     df['actual_link'] = df['link'].apply(get_real_url_selenium)
     df['full_text'] = df['actual_link'].apply(extract_text)
     df['summary'] = df['full_text'].apply(summarize_text)
-    df.to_csv(f'data/gnews_summarized/{START_DATE.strftime('%Y-%m-%d')}.csv')
+    df.to_csv(f'data/gnews_summarized/dxy_condensed.csv')
     print(f'{df.shape[0]} Articles total in file.')
     print(f'{df[df['summary'].notnull()].shape[0]} summaries produced.')

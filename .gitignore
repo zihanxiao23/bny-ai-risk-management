@@ -17,3 +17,8 @@ env/
 
 # Logs
 *.log
+
+# Large data files (exceed GitHub size limits)
+key_pipeline/data/dxy_intraday_min.csv
+key_pipeline/data/dxy_intraday/dxy_2020-now_utc.csv
+key_pipeline/data/forex_factory_cache.csv
