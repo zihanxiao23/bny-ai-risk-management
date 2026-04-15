@@ -1,5 +1,19 @@
 __pycache__/
 .ipynb_checkpoints/
 .DS_Store
+.env
 news_feeds/yahoo_finance/state/*.sqlite
 news_feeds/gdelt/state/*.sqlite
+
+# Claude Code
+CLAUDE.md
+.claude/
+memory/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Logs
+*.log
