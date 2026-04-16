@@ -230,26 +230,52 @@ NON_ACTIONABLE_CONTENT_TYPES = {"opinion", "analysis", "preview", "recap"}
 # not just whatever event happens to dominate the first rows.
 # ==============================================================================
 
-def load_few_shot_examples(ground_truth_csv_path, max_examples=42):
+def load_few_shot_examples(ground_truth_csv_path, max_examples=None):
     """
     Load ALL labeled ground truth articles for use as a RAG knowledge base.
 
     When USE_RAG=True (default), retrieval handles relevance selection at
     runtime — so we load every example here rather than sampling.
-    max_examples is kept as a hard cap for safety but defaults to 42 so
-    all rows are included.
+    max_examples can be set to an int to cap rows for debugging.
+    Default None means load all rows.
 
     Returns a list of dicts ready for build_rag_index() and build_rag_few_shot_block().
     """
     print(f"📂 Loading RAG ground truth: {ground_truth_csv_path}")
     gt_df = pd.read_csv(ground_truth_csv_path)
 
-    required = {"title", "gt_content_type", "gt_event_number", "gt_criticality_level"}
+    required = {"title", "gt_content_type", "gt_event_number"}
     missing = required - set(gt_df.columns)
     if missing:
         raise ValueError(
             f"Ground truth CSV is missing required columns: {missing}\n"
             f"Found columns: {list(gt_df.columns)}"
+        )
+
+    # Backward/forward compatibility:
+    # - Older schema: gt_criticality_level (high|medium|low)
+    # - Newer schema: true_criticality (high|not high)
+    # Normalise into gt_criticality_level for downstream prompt formatting.
+    if "gt_criticality_level" not in gt_df.columns:
+        if "true_criticality" not in gt_df.columns:
+            raise ValueError(
+                "Ground truth CSV must include either 'gt_criticality_level' "
+                "or 'true_criticality'.\n"
+                f"Found columns: {list(gt_df.columns)}"
+            )
+        crit_map = {
+            "high": "high",
+            "medium": "medium",
+            "low": "low",
+            "not high": "low",
+        }
+        gt_df["gt_criticality_level"] = (
+            gt_df["true_criticality"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .map(crit_map)
+            .fillna("low")
         )
 
     # Derive gt_event_name from gt_event_number via lookup table
@@ -259,13 +285,24 @@ def load_few_shot_examples(ground_truth_csv_path, max_examples=42):
         bad = gt_df.loc[unknown, "gt_event_number"].unique().tolist()
         raise ValueError(f"Ground truth contains unrecognised gt_event_number values: {bad}")
 
-    # Load all rows (RAG retrieval selects the relevant ones per article)
-    sampled = gt_df.head(max_examples).reset_index(drop=True)
+    # Load all rows by default (RAG retrieval selects relevant ones per article).
+    # Optional cap is useful for debugging/ablation runs.
+    if max_examples is None:
+        sampled = gt_df.reset_index(drop=True)
+    else:
+        sampled = gt_df.head(max_examples).reset_index(drop=True)
 
     # Resolve content column
     content_col = (
         "full_text" if "full_text" in gt_df.columns
         else "content" if "content" in gt_df.columns
+        else None
+    )
+    published_col = (
+        "article_published_utc" if "article_published_utc" in gt_df.columns
+        else "published_utc" if "published_utc" in gt_df.columns
+        else "published" if "published" in gt_df.columns
+        else "article_date" if "article_date" in gt_df.columns
         else None
     )
 
@@ -296,13 +333,28 @@ def load_few_shot_examples(ground_truth_csv_path, max_examples=42):
         moves = {col: _fmt_pct(row.get(col)) for col in _MOVE_COLS
                  if col in gt_df.columns}
 
+        macro_features = {}
+        for col in MACRO_COLUMNS:
+            v = row.get(col)
+            if pd.notna(v):
+                try:
+                    macro_features[col] = float(v)
+                except (TypeError, ValueError):
+                    macro_features[col] = 0.0
+            else:
+                macro_features[col] = 0.0
+
         examples.append({
             "title":             str(row["title"]),
             "content_preview":   content_preview,
             "content_type":      str(row["gt_content_type"]),
+            "event_number":      int(row["gt_event_number"]),
+            "tier":              EVENT_TIERS.get(int(row["gt_event_number"]), 4),
             "event_name":        str(row["gt_event_name"]),   # resolved from number
+            "published_utc":     str(row.get(published_col, "")).strip() if published_col else "",
             "criticality_level": str(row["gt_criticality_level"]),
             "moves":             moves,   # dict of pct_1h/2h/4h/1d, may be empty
+            **macro_features,
         })
 
     print(f"✅ {len(examples)} few-shot examples loaded")
@@ -381,33 +433,45 @@ def build_rag_index(examples: list[dict]) -> dict:
 
     embeddings = _embed_texts(texts)
 
-    # --- NEW: build macro matrix ---
-    macro_matrix = np.array([
-        [ex.get(col, 0.0) for col in MACRO_COLUMNS]
-        for ex in examples
-    ], dtype=np.float32)
+    # --- Build macro feature matrix (z-score by column, cosine by row) ---
+    macro_matrix = np.array(
+        [[float(ex.get(col, 0.0)) for col in MACRO_COLUMNS] for ex in examples],
+        dtype=np.float32,
+    )
 
-    # normalize
     macro_mean = macro_matrix.mean(axis=0)
-    macro_std = macro_matrix.std(axis=0) + 1e-8
-    macro_matrix = (macro_matrix - macro_mean) / macro_std
+    macro_std = macro_matrix.std(axis=0)
+
+    # Avoid exploding values on near-constant columns.
+    valid_std = np.where(macro_std > 1e-6, macro_std, 1.0).astype(np.float32)
+    macro_matrix_z = (macro_matrix - macro_mean) / valid_std
+
+    # Row-normalise so macro similarity is cosine in [-1, 1].
+    macro_row_norms = np.linalg.norm(macro_matrix_z, axis=1, keepdims=True)
+    macro_row_norms = np.where(macro_row_norms > 1e-8, macro_row_norms, 1.0)
+    macro_matrix_unit = macro_matrix_z / macro_row_norms
 
     return {
         "embeddings": embeddings,
         "examples": examples,
 
-        # --- NEW ---
-        "macro_matrix": macro_matrix,
+        # Macro stats + unit vectors for cosine similarity
+        "macro_matrix_unit": macro_matrix_unit,
         "macro_mean": macro_mean,
-        "macro_std": macro_std,
+        "macro_std": valid_std,
     }
 
-def compute_macro_similarity(query_vec, macro_matrix, mean, std):
+def compute_macro_similarity(query_vec, macro_matrix_unit, mean, std):
     query_vec = np.array(query_vec, dtype=np.float32)
     query_vec = (query_vec - mean) / std
 
-    dist = np.linalg.norm(macro_matrix - query_vec, axis=1)
-    return -dist
+    qnorm = np.linalg.norm(query_vec)
+    if qnorm <= 1e-8:
+        # No macro signal available for this row; return neutral similarity.
+        return np.zeros(macro_matrix_unit.shape[0], dtype=np.float32)
+    query_unit = query_vec / qnorm
+    sims = macro_matrix_unit @ query_unit
+    return np.clip(sims, -1.0, 1.0)
 
 def retrieve_similar_examples(
     title,
@@ -424,16 +488,22 @@ def retrieve_similar_examples(
     # semantic similarity (existing)
     semantic_scores = rag_index["embeddings"] @ query_emb
 
-    # --- NEW: macro similarity ---
+    # Macro similarity (cosine, bounded in [-1, 1])
     macro_scores = compute_macro_similarity(
         query_macro,
-        rag_index["macro_matrix"],
+        rag_index["macro_matrix_unit"],
         rag_index["macro_mean"],
         rag_index["macro_std"]
     )
 
-    # --- NEW: combined score ---
-    final_scores = alpha * semantic_scores + beta * macro_scores
+    # Weighted blend of two cosine scores; normalise weights then clip to [-1, 1].
+    w_sum = alpha + beta
+    if w_sum <= 0:
+        alpha_n, beta_n = 1.0, 0.0
+    else:
+        alpha_n, beta_n = alpha / w_sum, beta / w_sum
+    final_scores = alpha_n * semantic_scores + beta_n * macro_scores
+    final_scores = np.clip(final_scores, -1.0, 1.0)
 
     top_k = min(k, len(rag_index["examples"]))
     idx = np.argsort(final_scores)[::-1][:top_k]
@@ -462,7 +532,7 @@ def build_rag_few_shot_block(retrieved: list[tuple[dict, float]]) -> str:
     lines = [
         "════════════════════════════════════════════════════════════════",
         "RETRIEVED EXAMPLES — most similar labeled articles from ground truth",
-        "Similarity score shown (1.0 = identical, 0.0 = unrelated).",
+        "Similarity score shown (-1.0 = opposite, 0.0 = unrelated, 1.0 = very similar).",
         "Use these to calibrate your classification of the article below.",
         "════════════════════════════════════════════════════════════════\n",
     ]
@@ -1339,7 +1409,7 @@ def process_csv_to_csv(
     input_csv_path,
     output_csv_path,
     ground_truth_csv_path=None,
-    max_few_shot_examples=42,
+    max_few_shot_examples=None,
     rag_k=6,
     use_rag=True,
     test_row_index=None,
@@ -1464,6 +1534,20 @@ def process_csv_to_csv(
                 print(f"🔍 RAG: {len(retrieved)} examples retrieved "
                       f"(best: {rag_top_similarity:.3f} — {rag_top_match[:50]})")
 
+            # -----------------------------------------------------------------
+            # TEMP DEBUG BLOCK (safe to comment out later):
+            # Print every retrieved RAG example with similarity, event number,
+            # tier, and publish timestamp (UTC).
+            # -----------------------------------------------------------------
+            if verbose and retrieved:
+                print("   📚 Retrieved examples (similarity + event + tier + published UTC + title):")
+                for i, (ex, sim) in enumerate(retrieved, 1):
+                    ex_title = str(ex.get("title", ""))[:120]
+                    ex_event = ex.get("event_number", "")
+                    ex_tier  = ex.get("tier", "")
+                    ex_pub   = str(ex.get("published_utc", "")).strip() or "N/A"
+                    print(f"      {i:>2}. sim={sim:+.3f} | event=#{ex_event} | tier={ex_tier} | published_utc={ex_pub} | {ex_title}")
+
         analysis = analyze_article_dxy(
             client, title, date, content,
             classifier_system_prompt=classifier_system_prompt,
@@ -1561,12 +1645,14 @@ def process_csv_to_csv(
 if __name__ == "__main__":
 
     output_df = process_csv_to_csv(
-        input_csv_path="data/aug_mar_cutoff_cln.csv",
-        output_csv_path="data/results_rag.csv",
-        ground_truth_csv_path="data/gt_ext_ft_macros_labeled.csv",
-        max_few_shot_examples=42,   # load all 42 — RAG selects the relevant ones
+        # input_csv_path="data/aug_mar_cutoff_cln.csv",
+        input_csv_path="data/test_set_sept_oct_rel.csv",
+        output_csv_path="data/test_index1_results_rag.csv",
+        # ground_truth_csv_path="data/gt_ext_ft_macros_labeled.csv",
+        ground_truth_csv_path="data/gt_300.csv",  # GT with true_criticality + true_direction
+        max_few_shot_examples=None, # load all GT rows — RAG selects relevant ones
         rag_k=6,                    # retrieve top 6 per article (try 5–8)
         use_rag=True,               # set False to fall back to legacy static few-shot
-        test_row_index=1,        # set to an int to test a single row
+        test_row_index=2,        # set to an int to test a single row
         verbose=True,
     )
