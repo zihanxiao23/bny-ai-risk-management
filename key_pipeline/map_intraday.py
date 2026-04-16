@@ -136,11 +136,11 @@ def main(results_csv: str, dxy_csv: str, output_csv: str,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Merge classified articles with DXY intraday prices")
-    parser.add_argument("--results", default="data/results_gt_ext200.csv",
+    parser.add_argument("--results", default="data/results_sept_oct_rel_2.csv",
                         help="Path to classified articles CSV (output of claude_dxy_predict.py)")
     parser.add_argument("--dxy",     default="data/dxy_intraday_min.csv",
                         help="Path to merged DXY intraday CSV (output of merge_dxy_intraday.py)")
-    parser.add_argument("--output",  default="data/results_gt_ext200_mapped.csv",
+    parser.add_argument("--output",  default="data/results_sept_oct_rel_2_mapped.csv",
                         help="Path for output mapped CSV")
     parser.add_argument("--rolling-days", type=int, default=ROLLING_DAYS_DEFAULT,
                         help="Trailing window in days for rolling |pct_15m| SD threshold")

@@ -27,7 +27,7 @@ import pandas as pd
 
 ET = "America/New_York"
 DXY_DEFAULT           = "data/dxy_intraday_min.csv"
-INPUT_DEFAULT         = "data/gt_100_new_ft_pub_macros.csv"
+INPUT_DEFAULT         = "data/gt_200_fix_new_macros.csv"
 COL_DEFAULT           = "article_published_utc"
 ROLLING_DAYS_DEFAULT  = 7
 

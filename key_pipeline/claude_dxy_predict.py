@@ -3,6 +3,7 @@ import time
 import anthropic
 import pandas as pd
 import json
+import pytz
 from datetime import datetime
 from dotenv import load_dotenv
 from consensus_extract_hf import (
@@ -202,7 +203,7 @@ NON_ACTIONABLE_CONTENT_TYPES = {"opinion", "analysis", "preview", "recap"}
 
 # Maximum GT examples injected into Agent 2 per tier.
 # Tier 1 default capped at 16; Tiers 2/3/4 use all available.
-GT_TIER_CAPS = {1: 16, 2: 999, 3: 999, 4: 999}
+GT_TIER_CAPS = {1: 35, 2: 999, 3: 999, 4: 999}
 
 
 def load_gt_dataframe(ground_truth_csv_path: str) -> "pd.DataFrame":
@@ -374,6 +375,7 @@ _POOL_B_MACRO_FIELDS = [
     ("vix_regime",            "VIX regime",          ""),
     ("dxy_zscore_52w_broad",  "DXY 52w z-score",    ""),
     ("dxy_20d_return_broad",  "DXY 20d return",      "%"),
+    ("sd_15m",                "DXY 15m vol (sd)",    "%"),
     ("cpi_yoy",               "CPI YoY",             "%"),
     ("core_cpi_yoy",          "Core CPI YoY",        "%"),
     ("unemployment_rate",     "Unemployment",        "%"),
@@ -591,19 +593,39 @@ DXY basket for reference: EUR 57.6% | JPY 13.6% | GBP 11.9% | CAD 9.1% | SEK 4.2
 CONTENT TYPE DEFINITIONS — classify this first
 ════════════════════════════════════════════════════════════════
 
-hard_news : Breaking report of a CURRENT event as it happens — data release just published,
-            decision just announced, statement just made. Primary source preferred.
+hard_news : Breaking report of a CURRENT event where the PRIMARY PURPOSE is
+            reporting the event itself — data release just published, decision
+            just announced, statement just made. Primary source preferred.
+            CRITICAL DISTINCTION: If the article mentions a decision or event
+            in the first paragraph but spends the majority of its length on
+            projections, analyst forecasts, forward-looking implications,
+            historical context, or explanatory background, classify it as
+            analysis, NOT hard_news. The event must be the subject of the
+            article, not a launching pad for commentary.
+            Example of hard_news: "Fed cuts rates 25bp; dot plot signals one
+            cut in 2026; Miran dissented for 50bp."
+            Example of analysis disguised as hard_news: "The Fed cut rates
+            again. Here's what it means for mortgages, savings, and 2026."
 preview   : Written BEFORE a scheduled event to discuss what analysts expect.
-            Key signal: "what to expect", "preview", "ahead of", "tomorrow's", "upcoming".
+            Key signal: "what to expect", "preview", "ahead of", "tomorrow's",
+            "upcoming". Does NOT apply to articles reporting a Fed official
+            speech or testimony that happened today — the speech is the event
+            itself, not a preview of a future scheduled decision.
 recap     : Written AFTER an event to summarise what happened.
-            Key signal: "here's what happened", "recap", "wrap-up", "look back".
-analysis  : Commentary, interpretation, or deep-dive that doesn't break new facts.
-            Often bylined opinion with sourced data but no new reporting.
-opinion   : Editorial, personal viewpoint, or speculative outlook with no news anchor.
+            Key signal: "here's what happened", "recap", "wrap-up", "look back",
+            "five takeaways", "what we learned".
+analysis  : Commentary, interpretation, or deep-dive that doesn't break new
+            facts. Often bylined opinion with sourced data but no new reporting.
+            Includes hybrid articles that open with a news fact then pivot to
+            extended forward-looking commentary or analyst projections.
+opinion   : Editorial, personal viewpoint, or speculative outlook with no
+            news anchor.
 
 ────────────────────────────────────────────────────────────────
-RULE: preview and recap articles CANNOT drive high criticality
-regardless of event tier. Label them correctly.
+RULE: preview, recap, analysis, and opinion articles CANNOT drive
+high criticality regardless of event tier. Label them correctly.
+The hard_news label requires the PRIMARY PURPOSE to be reporting
+the event — not explaining, projecting, or contextualising it.
 ────────────────────────────────────────────────────────────────
 
 ════════════════════════════════════════════════════════════════
@@ -852,34 +874,77 @@ For DIRECTION CHAIN:
 HARD FLOORS — these override all other reasoning
 ════════════════════════════════════════════════════════════════
 
-── FOMC DECISIONS (ALWAYS HIGH) ────────────────────────────────
-All actual FOMC decisions (rate cut, hike, or hold) are HIGH criticality.
-Forward guidance — dot plot, pace language, vote count, press conference
-framing — always carries incremental information not priced in prior to
-release. Never downgrade an FOMC announcement to low on the grounds that
-the decision itself was expected.
+── CONTENT TYPE FLOORS — decided before all event-type rules ────
+The following content types are ALWAYS not high. No event type,
+tier, or Fed event can override these:
+  • opinion   → always not high
+  • analysis  → always not high
+  • preview   → always not high
+  • recap     → always not high
 
-── FOMC CARVE-OUT FOR "ALREADY PRICED IN" ──────────────────────
-For FOMC events (event types 1, 2, 3, 4, 31), the "already priced in"
-and "widely expected" downgrade rules do NOT apply to:
-  • The decision announcement itself (rate cut, hike, or hold)
-  • The press conference or Powell speech content
-  • Dot plot or rate path guidance
-  • Vote composition and dissents
-These always contain incremental information not fully priced in before
-release. Only downgrade an FOMC article when ALL THREE conditions hold:
-  (a) Published 12+ hours after the event
-  (b) Contains no new quotes, dissent detail, or forward guidance
-  (c) Is purely descriptive recap of what was already widely reported
+These are enforced in Python before this prompt runs. If the
+content_type is not hard_news, return not high immediately.
+The FOMC information-content test below applies ONLY when
+content_type = hard_news.
 
-── CONTENT TYPE FLOORS (non-negotiable) ────────────────────────
-- opinion, analysis, preview, recap → ALWAYS not high, no exceptions
-- Article written BEFORE a scheduled event → ALWAYS not high
-- Post-event recap of something already fully priced in → not high
-- If your reasoning would include the phrases "already priced in",
-  "widely expected", "no new information", or "no surprise" → must
-  return not high
-  EXCEPTION: FOMC carve-out above takes precedence for Fed events.
+── ARTICLE TIMING FLOORS — for scheduled events only ───────────
+The article_timing field in Pre-classification tells you where
+the article sits relative to its event's release window.
+
+'live_window'   → Article is contemporaneous. Apply normal
+                  criticality logic — event content determines
+                  the outcome.
+
+'pre_release'   → Published before the scheduled release.
+                  ALWAYS not high for data releases (NFP, CPI,
+                  GDP, retail sales, PMI). These are previews.
+                  EXCEPTION: If the article reports a Fed official
+                  speech or testimony that happened today (not
+                  a preview of a future decision), treat the speech
+                  itself as the event and apply normal logic.
+
+'same_day_post' → Published after market close on release day.
+                  ALWAYS not high. The market has already priced
+                  the information. This is enforced in Python.
+
+'next_day_plus' → Published the day after the release or later.
+                  ALWAYS not high. Enforced in Python.
+
+'unscheduled'   → No fixed release window (tariff shocks,
+                  executive orders, judicial rulings, Fed speeches
+                  outside FOMC day). Timing floor NOT applied —
+                  use content-based judgment.
+
+'unknown'       → Timestamp could not be parsed. Use content-
+                  based judgment; be conservative.
+
+── FOMC EVENTS — information-content test ───────────────────────
+For Fed events (event types 1, 2, 3, 4, 31), do NOT apply a
+blanket high floor. Instead check whether this article is the
+vehicle by which new information enters the market — or whether
+it is downstream commentary on information that already moved
+markets.
+
+Mark HIGH only when ALL of the following hold:
+  (a) content_type = hard_news
+  (b) article_timing = 'live_window'
+  (c) The article contains at least one of:
+        • The actual rate decision text announced for the first time
+        • New dot plot / SEP projections
+        • Specific dissent votes and direction (hawkish or dovish)
+        • New forward guidance language not in the prior statement
+        • Direct Chair quotes on rate path from this session's
+          press conference or speech
+
+Mark NOT HIGH when any of the following:
+  • article_timing is 'same_day_post' or 'next_day_plus' — market
+    has already priced the information; this is commentary
+  • article_timing is 'pre_release' — the decision has not occurred
+  • The article is a consumer explainer ("what this means for your
+    mortgage / credit card / savings") regardless of timing
+  • The article spends more than half its content on projections,
+    analyst forecasts, or multi-year outlook rather than the
+    decision itself — classify that as analysis, not hard_news
 
 ── SURROGATE INDICATORS (ALWAYS LOW) ───────────────────────────
 ADP private payrolls, Challenger job cuts, JOLTS job openings,
@@ -920,17 +985,64 @@ in reasoning. If source credibility is uncertain → not high.
   predict..." → downgrade
 - Data release described as delayed, revised, or partially priced in
   → not high
-  EXCEPTION: FOMC carve-out above takes precedence for Fed events.
+
+── ALREADY-PRICED RULE (applies to ALL event types and tiers) ───
+If the DXY or market move described in the article had already fully
+occurred before the article was published, the information is priced
+into the market. The article is commentary, not actionable news.
+Return not high regardless of event type, tier, or timing label.
+
+Ask: is the article reporting that a move IS happening right now,
+or IS IT reporting that a move HAS happened? Only the former is high.
+
+Signals that the move is already priced:
+  • Past-tense price descriptions: "the dollar fell", "DXY dropped to",
+    "the euro gained", "yields surged earlier today/yesterday"
+  • Explicit framing of a completed event: "following the announcement",
+    "in the wake of", "after the decision", "since the ruling"
+  • The article references a specific prior time for when the move
+    occurred: "the dollar hit X% at 10am", "markets reacted when..."
+  • The article explains WHY a move happened rather than reporting
+    that it IS happening
+
+This rule applies even for unscheduled events with article_timing =
+'unscheduled'. A tariff shock article published 6 hours after the
+announcement, describing a DXY move that has already fully reversed
+or stabilised, is not high — the information has been priced.
 
 ── ESCALATION TRIGGERS (Tier 3/4 unscheduled events only) ──────
+Only apply these if the already-priced rule above does NOT apply —
+i.e. the article is reporting a live, ongoing event, not explaining
+a past one.
 - "emergency meeting", "unscheduled rate decision", "surprise cut/hike"
 - Explicitly described as historic or unprecedented in scope
 - Tariffs raised to 50%+ on DXY-basket countries
 - Fiscal package $500B+ | Bank failure $500B+ assets
-- "dollar plunged/surged X%", "yields spiked X bps", "circuit breakers"
-- USD safe-haven demand described as materialising, not merely predicted
+- USD safe-haven demand described as materialising right now, not
+  merely predicted or having already occurred
 - Senior Fed/Treasury official directly contradicting current policy
 - Sanctions or asset freezes impairing dollar liquidity or reserve status
+
+── DE-ESCALATION TRIGGERS (Tier 3 trade events only) ───────────
+The same already-priced rule applies. Only mark high when the article
+is the live vehicle for the information — not when it is reporting
+on a de-escalation that markets have already absorbed.
+
+Mark HIGH when article_timing = 'unscheduled' AND the article is
+reporting a live, confirmed event:
+  • Tariffs confirmed to take effect materially below the threatened
+    level, with markets actively repricing as the article is published
+  • A court ruling invalidating a major tariff regime, reported on
+    the day of the ruling before full market absorption
+  • A bilateral deal announced for the first time with confirmed rate
+    reductions and a binding implementation date
+
+Do NOT mark high when:
+  • article_timing is 'same_day_post' or 'next_day_plus'
+  • The move has already occurred and the article is explaining it
+  • Negotiations are still in progress without a confirmed outcome
+  • The affected economies are non-basket (India, Brazil, etc.) with
+    no explicit link to USD reserve demand or broad dollar positioning
 
 ════════════════════════════════════════════════════════════════
 MACRO REGIME CONTEXT — how to use it
@@ -939,6 +1051,28 @@ MACRO REGIME CONTEXT — how to use it
 When a MACRO REGIME CONTEXT block is present, use it to calibrate
 criticality and direction within the tier default range. It does not
 override hard floors but adjusts your judgment for the current environment.
+
+── DXY VOLATILITY THRESHOLD (sd_15m) ───────────────────────────
+The macro context may include a line labelled "DXY 15m vol (sd_15m)"
+followed by a high-criticality threshold, for example:
+  DXY 15m vol (sd_15m)    : 0.0265%  [high-criticality threshold: |pct_15m| > 0.0265%]
+
+This is the rolling 7-day standard deviation of 15-minute DXY moves.
+It is the EXACT threshold used to compute the true_criticality labels
+in the few-shot examples — a move must exceed 1× sd_15m to qualify as
+high criticality.
+
+Use it to sanity-check your judgment:
+  • If an article describes a DXY move and you can infer its magnitude,
+    compare it to the threshold. A 0.010% move when sd=0.027% is well
+    below threshold and supports not high.
+  • If Pool B examples show similar events labeled high with sd_15m
+    values close to the current one, that calibration transfers directly.
+  • For unscheduled events where the article mentions "DXY fell X%" or
+    "dollar moved Y bps", use the threshold to assess whether that move
+    would cross the high boundary before calling high.
+  • Do NOT use sd_15m to infer direction — it tells you about magnitude
+    only, not which way DXY moved.
 
 ── POSITIONING IS A CRITICALITY SIGNAL ONLY, NOT A DIRECTION SIGNAL ──
 DXY z-score and CFTC positioning tell you whether a move could be larger
@@ -1068,8 +1202,26 @@ def build_macro_context(macro_row: dict, event_number: int) -> str:
         dxy_lines.append(f"  DXY 20d return          : {_v('dxy_20d_return_broad')}%")
     if _v("dxy_pct_above_200d_broad"):
         dxy_lines.append(f"  DXY % above 200d MA     : {_v('dxy_pct_above_200d_broad')}%")
+
+    # sd_15m: rolling 7-day SD of 15-min DXY moves. This is the exact volatility
+    # threshold used to compute true_criticality labels — a pct_15m move must
+    # exceed 1× sd_15m to qualify as high criticality. Expose both the SD and
+    # the implied threshold so Agent 2 can reason about move magnitude directly
+    # rather than relying solely on pattern matching from few-shot examples.
+    sd_val = macro_row.get("sd_15m")
+    if sd_val is not None:
+        try:
+            sd_f = float(sd_val)
+            if not math.isnan(sd_f) and sd_f > 0:
+                dxy_lines.append(
+                    f"  DXY 15m vol (sd_15m)    : {sd_f:.4f}%  "
+                    f"[high-criticality threshold: |pct_15m| > {sd_f:.4f}%]"
+                )
+        except (TypeError, ValueError):
+            pass
+
     if dxy_lines:
-        lines.append("  [DXY Positioning]")
+        lines.append("  [DXY Positioning & Volatility]")
         lines.extend(dxy_lines)
 
     # ── Risk Environment — always inject ─────────────────────────────────────
@@ -1175,20 +1327,172 @@ def extract_macro_row(row: pd.Series) -> dict:
     return macro
 
 
+# ==============================================================================
+# ARTICLE TIMING CLASSIFIER
+#
+# Determines how close an article's publication timestamp is to the live
+# release window for its event type. This is computed in Python before
+# Agent 2 is called — the model receives a structured label, not raw
+# timestamps to interpret.
+#
+# Scheduled events have known release windows (ET). Articles published
+# within the live window are treated as contemporaneous news. Articles
+# published after the market has closed on the same day are treated as
+# commentary. Articles published the next day or later are always stale.
+#
+# Unscheduled events (tariff shocks, executive orders, judicial rulings,
+# Fed official speeches outside FOMC day) have no fixed release window.
+# These are marked 'unscheduled' and the timing floor is NOT applied —
+# the model must use content-based judgment for these.
+# ==============================================================================
+
+# Events with a known scheduled release time. Timing floors are only
+# enforced for these — unscheduled events are left to model judgment.
+_SCHEDULED_EVENTS = {1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22}
+
+# Release time (ET) and live window duration (hours) by event group.
+# live_end_hour: hour after which same-day articles are considered stale.
+_RELEASE_WINDOWS = {
+    # FOMC decisions: announced Wed 14:00 ET, press conf ends ~15:30
+    # live window: 13:45–16:30 to capture decision + full press conference
+    "fomc":      {"days": [2], "release_hour": 14, "release_min": 0,
+                  "live_start": (13, 45), "live_end": (16, 30), "stale_hour": 16},
+    # Standard 08:30 ET releases: NFP, CPI, PCE, GDP, retail sales.
+    # live_start is 08:15 (15-min buffer) to absorb publication timestamp lag —
+    # articles published minutes after the data drops may carry a slightly
+    # early timestamp in the source feed.
+    # live_end is 13:00 to keep early-afternoon market consequence articles
+    # (bond/mortgage rate moves, yield commentary) within the live window.
+    "data_0830": {"days": list(range(7)), "release_hour": 8, "release_min": 30,
+                  "live_start": (8, 15), "live_end": (13, 0), "stale_hour": 17},
+    # PMI/ISM: released 10:00 ET.
+    # live_start is 09:45 (15-min buffer); live_end extended to 13:00.
+    "data_1000": {"days": list(range(7)), "release_hour": 10, "release_min": 0,
+                  "live_start": (9, 45), "live_end": (13, 0), "stale_hour": 17},
+}
+
+# Map event numbers to release window keys
+_EVENT_WINDOW_MAP = {
+    1: "fomc", 2: "fomc", 3: "fomc", 4: "fomc",   # FOMC decisions/pivots
+    7: "data_0830", 8: "data_0830", 9: "data_0830",  # CPI/PCE
+    10: "data_0830", 11: "data_0830", 12: "data_0830",  # NFP/employment
+    13: "data_0830", 14: "data_0830",                # GDP
+    15: "data_0830", 16: "data_0830",                # Retail sales
+    17: "data_1000", 18: "data_1000",                # PMI/ISM
+    20: "data_0830", 21: "data_0830", 22: "data_0830",  # Trade/fiscal
+}
+
+
+def classify_article_timing(article_published_utc: str, event_number: int,
+                             article_title: str = "") -> str:
+    """
+    Classify how close an article's publication is to the live release
+    window for its event type.
+
+    Returns one of:
+      'live_window'    — published during the active release + reaction window
+      'pre_release'    — published before the release on the same day
+      'same_day_post'  — published same calendar day but after market close
+                         (US markets close ~16:00 ET; stale_hour is 17:00)
+      'next_day_plus'  — published the calendar day after the release or later
+      'unscheduled'    — event has no fixed release window; timing not enforced
+      'unknown'        — unparseable timestamp
+
+    The 'same_day_post' and 'next_day_plus' results trigger a Python-level
+    not-high floor for scheduled events (see agent_2_criticality).
+    'unscheduled' events are never floored by timing — model judgment applies.
+
+    article_title is used to detect publication-lag edge cases: if a timestamp
+    lands in the pre_release window but the title clearly contains outcome
+    language (beat/miss/actual figures), the article was almost certainly
+    published after the release with a slight timestamp lag and is reclassified
+    as live_window.
+    """
+    if event_number not in _SCHEDULED_EVENTS:
+        return 'unscheduled'
+
+    window_key = _EVENT_WINDOW_MAP.get(event_number)
+    if not window_key or not article_published_utc:
+        return 'unknown'
+
+    et = pytz.timezone('America/New_York')
+    try:
+        dt_et = (pd.to_datetime(article_published_utc, utc=True)
+                   .to_pydatetime()
+                   .astimezone(et))
+    except Exception:
+        return 'unknown'
+
+    window   = _RELEASE_WINDOWS[window_key]
+    dow      = dt_et.weekday()      # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+    h, m     = dt_et.hour, dt_et.minute
+    hm       = (h, m)
+
+    # FOMC: only valid on Wednesdays (standard) or the configured days
+    if window_key == "fomc":
+        if dow not in window["days"]:
+            # Not a Wednesday — could be a Thursday follow-up
+            if dow == 3 and h < 6:
+                return 'same_day_post'   # very early Thursday, same session
+            return 'unscheduled'         # non-FOMC day; let model decide
+        if hm < window["live_start"]:
+            return 'pre_release'
+        elif hm <= window["live_end"]:
+            return 'live_window'
+        else:
+            return 'same_day_post'
+
+    # General scheduled data releases (any weekday).
+    raw_timing: str
+    if hm < window["live_start"]:
+        raw_timing = 'pre_release'
+    elif hm <= window["live_end"]:
+        raw_timing = 'live_window'
+    else:
+        raw_timing = 'same_day_post'
+
+    # Publication-lag correction: articles timestamped up to 30 minutes before
+    # the official release time may still be reporting the actual outcome if
+    # the title contains outcome language. This handles feeds that stamp at
+    # article creation rather than final publish time.
+    if raw_timing == 'pre_release' and article_title:
+        _OUTCOME_SIGNALS = (
+            "weaker-than-expected", "stronger-than-expected",
+            "better-than-expected", "worse-than-expected",
+            "beat", "miss", "missed", "beats", "misses",
+            "above expectations", "below expectations",
+            "rose more than", "fell short", "surprised",
+            "sluggish", "surged", "plunged", "jumped",
+            "higher than expected", "lower than expected",
+        )
+        title_lower = article_title.lower()
+        # Only apply the correction if timestamp is within 30 min of live_start
+        release_h, release_m = window["live_start"]
+        mins_before_live = (release_h * 60 + release_m) - (h * 60 + m)
+        if mins_before_live <= 30 and any(s in title_lower for s in _OUTCOME_SIGNALS):
+            return 'live_window'
+
+    return raw_timing
+
+
 def agent_2_criticality(client, title, date, content, event_number, content_type,
                          system_prompt: str = "", consensus_context: str = "",
-                         macro_context: str = "", tier_few_shot_block: str = ""):
+                         macro_context: str = "", tier_few_shot_block: str = "",
+                         article_timing: str = "unknown"):
     """
     Assess criticality of a relevant article.
 
     Default by tier (factual hard_news only):
       Tier 1 -> high  |  Tier 2/3/4 -> not high
 
-    Hard floors (enforced both in prompt and in Python post-call):
-      preview / recap / analysis / opinion -> always not high
+    Hard floors (enforced both in prompt AND in Python post-call):
+      preview / recap / analysis / opinion       -> always not high
+      same_day_post / next_day_plus (scheduled)  -> always not high
 
+    article_timing:       pre-computed result of classify_article_timing().
+                          Injected into user prompt and enforced in Python.
     consensus_context:    pre-formatted historical DXY reaction table string.
-    macro_context:        pre-formatted point-in-time macro regime string.
+    macro_context:        point-in-time macro regime string.
     tier_few_shot_block:  Pool B -- GT examples from the same tier.
                           Injected FIRST so the model sees real criticality/
                           direction patterns before the quantitative context.
@@ -1199,12 +1503,29 @@ def agent_2_criticality(client, title, date, content, event_number, content_type
     event_name = EVENT_NAMES.get(event_number, "Other / Mixed")
     is_non_actionable = content_type in NON_ACTIONABLE_CONTENT_TYPES
 
-    if is_non_actionable:
+    # Python-level timing floor: stale scheduled-event articles are never high
+    is_stale_scheduled = (
+        article_timing in {'same_day_post', 'next_day_plus'}
+        and event_number in _SCHEDULED_EVENTS
+    )
+
+    if is_non_actionable or is_stale_scheduled:
         default_level = "not high"
     elif tier == 1:
         default_level = "high"
     else:
         default_level = "not high"
+
+    # Human-readable timing explanation for the prompt
+    _timing_explain = {
+        'live_window':    "LIVE — published during the active release/reaction window",
+        'pre_release':    "PRE-RELEASE — published before the scheduled release time today",
+        'same_day_post':  "STALE (same day) — published after market close on release day",
+        'next_day_plus':  "STALE (next day+) — published the day after the release or later",
+        'unscheduled':    "UNSCHEDULED — no fixed release window; timing floor not applied",
+        'unknown':        "UNKNOWN — timestamp could not be parsed",
+    }
+    timing_note = _timing_explain.get(article_timing, article_timing)
 
     if consensus_context:
         table_reminder = ("A historical response table is provided. "
@@ -1213,8 +1534,6 @@ def agent_2_criticality(client, title, date, content, event_number, content_type
         table_reminder = "No historical data available. Use qualitative reasoning only."
 
     # Injection order: tier few-shot -> macro -> consensus -> article
-    # Tier examples first so the model internalises tier-level patterns before
-    # seeing the quantitative context blocks.
     tier_block      = f"\n{tier_few_shot_block}\n" if tier_few_shot_block else ""
     consensus_block = f"\n{consensus_context}\n"   if consensus_context   else ""
     macro_block     = f"\n{macro_context}\n"       if macro_context       else ""
@@ -1227,6 +1546,7 @@ Pre-classification:
   Event type          : {event_name} (Category #{event_number})
   Research-based tier : {tier_label}
   Content type        : {content_type}
+  Article timing      : {article_timing} — {timing_note}
   Default criticality : {default_level}  <- starting point; confirm or override
 {tier_block}{macro_block}{consensus_block}
 Article:
@@ -1247,8 +1567,10 @@ Return ONLY valid JSON with no commentary before or after:
     try:
         result = call_claude(client, user_prompt, system_prompt=system_prompt,
                              max_tokens=512)
-        # Enforce hard floor in Python -- model cannot override this
+        # Enforce hard floors in Python — model cannot override these
         if is_non_actionable:
+            result["criticality_level"] = "not high"
+        if is_stale_scheduled:
             result["criticality_level"] = "not high"
         return result
     except Exception as e:
@@ -1379,6 +1701,9 @@ def analyze_article_dxy(client, title, date, content,
     if is_irrelevant:
         return {"agent1": a1, "agent2": None}
 
+    # --- Compute article timing relative to event release window ---
+    article_timing = classify_article_timing(date, event_number, article_title=title)
+
     # --- Build consensus context for Agent 2 ---
     consensus_record  = lookup_consensus_history(event_number, consensus_df,
                             article_date=date) if consensus_df is not None else None
@@ -1393,6 +1718,8 @@ def analyze_article_dxy(client, title, date, content,
     # --- Build Pool B tier few-shot block for Agent 2 ---
     tier_few_shot_block = build_tier_few_shot_block(gt_df, tier) if gt_df is not None else ""
 
+    if verbose:
+        print(f"   article timing : {article_timing}")
     if verbose and consensus_context:
         print(f"   consensus context: {len(history_table.splitlines())} history rows")
     if verbose and macro_context:
@@ -1411,6 +1738,7 @@ def analyze_article_dxy(client, title, date, content,
         consensus_context=consensus_context,
         macro_context=macro_context,
         tier_few_shot_block=tier_few_shot_block,
+        article_timing=article_timing,
     )
 
     if verbose:
@@ -1551,8 +1879,9 @@ def process_csv_to_csv(
         a1 = analysis["agent1"]
         a2 = analysis["agent2"]   # None when irrelevant
 
-        event_num = a1.get("event_number", IRRELEVANT_EVENT_NUMBER)
-        tier      = EVENT_TIERS.get(event_num) if event_num != IRRELEVANT_EVENT_NUMBER else None
+        event_num      = a1.get("event_number", IRRELEVANT_EVENT_NUMBER)
+        tier           = EVENT_TIERS.get(event_num) if event_num != IRRELEVANT_EVENT_NUMBER else None
+        article_timing = classify_article_timing(date, event_num, article_title=title) if event_num != IRRELEVANT_EVENT_NUMBER else None
 
         out_row = {
             # ---- original columns ----
@@ -1573,6 +1902,7 @@ def process_csv_to_csv(
             "content_type":              a1.get("content_type"),
             "classification_confidence": a1.get("confidence"),
             "event_tier":                tier,
+            "article_timing":            article_timing,
             # ---- agent 2 raw output (None for irrelevant) ----
             "criticality_level":    a2.get("criticality_level")    if a2 else None,
             "reasoning":            a2.get("reasoning")            if a2 else None,
@@ -1651,9 +1981,9 @@ def process_csv_to_csv(
 if __name__ == "__main__":
 
     output_df = process_csv_to_csv(
-        input_csv_path="data/aug_mar_cutoff_cln.csv",
-        output_csv_path="data/results_gt_ext200.csv",
-        ground_truth_csv_path="data/gt_cum200.csv",  # GT with true_criticality + true_direction
+        input_csv_path="data/test_set_sept_oct_rel.csv",
+        output_csv_path="data/results_sept_oct_rel_2.csv",
+        ground_truth_csv_path="data/gt_recent.csv",  # GT with true_criticality + true_direction
         # Pool A: examples injected into Agent 1 classifier system prompt (cached)
         # Balanced sample across event types -- 2 per event type up to this cap
         max_few_shot_examples=42,
