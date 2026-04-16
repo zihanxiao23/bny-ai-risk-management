@@ -115,6 +115,9 @@ ERROR_DELAY = 5  # Seconds to wait after error
 DAY_DELAY_MIN = 5  # Minimum seconds between days
 DAY_DELAY_MAX = 10  # Maximum seconds between days
 
+# Default output directory (override in __main__ if needed)
+OUTPUT_DIR = "data/dxy_training/cnbc"
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
@@ -358,8 +361,8 @@ if __name__ == "__main__":
     END_DATE = datetime(2026, 2, 28)
     ARTICLES_PER_DAY = 40
 
-    # Output directory
-    OUTPUT_DIR = 'data/cnbc/'
+    # Output directory (aligned with historical CNBC daily corpus)
+    OUTPUT_DIR = "data/dxy_training/cnbc"
     
     print("\n🚀 Starting DXY/USD dataset collection...")
     print(f"📅 Date range: {START_DATE.strftime('%Y-%m-%d')} to {END_DATE.strftime('%Y-%m-%d')}")

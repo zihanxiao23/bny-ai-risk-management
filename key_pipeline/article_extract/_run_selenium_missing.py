@@ -5,7 +5,7 @@ full_text is NaN. Writes the merged 340-row result to data/gt_340_ft.csv.
 """
 import sys, time
 sys.path.insert(0, ".")
-from selenium_try import get_all_urls, extract_text
+from key_pipeline.article_extract.selenium_try import get_all_urls, extract_text
 import pandas as pd
 
 INPUT  = "data/gt_340.csv"

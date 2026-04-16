@@ -16,7 +16,7 @@ Usage
 import argparse
 import pandas as pd
 import numpy as np
-from label_true_criticality import trailing_sd_at
+from key_pipeline.intraday.label_true_criticality import trailing_sd_at
 
 ET = "America/New_York"
 ROLLING_DAYS_DEFAULT = 7

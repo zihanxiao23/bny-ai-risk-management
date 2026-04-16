@@ -22,14 +22,14 @@ Methodology
 
 Input
 -----
-data/dxy_training/claude/output_mgd_try.csv   (output of IntradayMapping.ipynb)
+data/dxy_training/claude/output_mgd_try.csv   (example mapped input; prefer output of map_intraday)
 
 Usage
 -----
-    python eval_signal.py
-    python eval_signal.py --input path/to/other.csv
-    python eval_signal.py --no-dedup             # skip event deduplication
-    python eval_signal.py --ny-session           # restrict to 8am–5pm ET only
+    python -m key_pipeline.evaluation.eval_signal
+    python -m key_pipeline.evaluation.eval_signal --input path/to/other.csv
+    python -m key_pipeline.evaluation.eval_signal --no-dedup             # skip event deduplication
+    python -m key_pipeline.evaluation.eval_signal --ny-session           # restrict to 8am–5pm ET only
 """
 
 import argparse

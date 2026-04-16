@@ -1,11 +1,16 @@
 """
-Full pipeline runner:
+Article pipeline runner (lives under key_pipeline/article_extract/).
+
   Step 1 – URL resolution + text extraction  → apr_jan_ft.csv
-  Step 2 – Scrape actual publish times        → apr_jan_pub_ac.csv  (via scrape_publish_time.py)
+  Step 2 – Scrape actual publish times        → apr_jan_pub_ac.csv
   Step 3 – Clean: keep rows where full_text is not null → apr_jan_cln.csv
-  Step 4 – Claude DXY classification          → apr_jan_res.csv     (via claude_dxy_predict.py)
+  Step 4 – Claude DXY classification          → apr_jan_res.csv  (only if --through classify)
+
+For the default orchestrated order (macro before predict), use --through clean here and run
+`python -m key_pipeline.predict.run_apr_jan_classify` after macro merge.
 """
 
+import argparse
 import os
 import sys
 import time
@@ -113,7 +118,7 @@ def step2_scrape_times():
     log("=== STEP 2: Scraping publish times ===")
 
     # scrape_published_times appends .csv to out_file_name, so pass without extension
-    from scrape_publish_time import scrape_published_times
+    from key_pipeline.article_extract.scrape_publish_time import scrape_published_times
     scrape_published_times(
         in_file_name=FT_CSV,
         out_file_name=PUB_CSV,   # function will save to PUB_CSV + ".csv"
@@ -150,7 +155,7 @@ def step3_clean():
 def step4_classify():
     log("=== STEP 4: Running Claude DXY predict ===")
 
-    import claude_dxy_predict as cdp
+    from key_pipeline.predict import claude_dxy_predict as cdp
     cdp.process_csv_to_csv(
         input_csv_path=CLN_CSV,
         output_csv_path=DIR + "apr_jan_res.csv",
@@ -167,6 +172,17 @@ def step4_classify():
 # ==============================================================================
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(
+        description="URL resolution, full text, publish times, optional clean-only or full classify."
+    )
+    ap.add_argument(
+        "--through",
+        choices=("clean", "classify"),
+        default="classify",
+        help="clean = steps 1–3 only (no LLM). classify = include step 4 Claude classification.",
+    )
+    args = ap.parse_args()
+
     log("Pipeline starting.")
     start = time.time()
 
@@ -176,6 +192,8 @@ if __name__ == "__main__":
         ("step3_clean",             step3_clean),
         ("step4_classify",          step4_classify),
     ]
+    if args.through == "clean":
+        steps = steps[:3]
 
     for name, fn in steps:
         try:

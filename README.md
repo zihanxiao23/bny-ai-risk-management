@@ -1,24 +1,20 @@
 # BNY-AI-Risk-Management
-This repository is for our Duke MIDS (Masters in Interdisciplinary Data Science) Capstone project with BNY Mellon. As we are focused on developing an AI-driven solution for risk management, the repo includes analysis, modeling, and product code.
 
-## GDELT weekly backfill behavior
+Duke MIDS capstone work with BNY Mellon: analysis, modeling, and pipeline code for AI-driven risk management.
 
-The GDELT ingestion workflow (`news_feeds/gdelt`) appends new articles and then backfills
-older rows with empty summaries on each weekly run. Backfill is intentionally incremental:
-the pipeline selects up to `summary.backfill_limit` oldest missing summaries each run,
-so historical summaries fill in gradually over multiple weeks. Tune the limits in
-`news_feeds/gdelt/config.yaml`:
+## Key pipeline (DXY / CNBC)
 
-- `summary.max_hf_new_per_run`: Hugging Face summary attempts reserved for newly ingested rows.
-- `summary.max_hf_backfill_per_run`: Hugging Face summary attempts reserved for backfill rows.
-- `summary.backfill_limit`: how many historical rows to attempt per run (raise to accelerate
-  backfill, lower to reduce runtime).
-- `summary.denylist_domains`: domains skipped during backfill when they are low quality.
+The **active** ingestion, article processing, macro merge, intraday mapping, prediction, and evaluation code lives in **`key_pipeline/`**. Start here:
 
-## GDELT ingestion resiliency
+- [key_pipeline/README.md](key_pipeline/README.md)
+- One-shot orchestrator (from repo root): `python key_pipeline/run_key_pipeline.py`
+- **Google News → daily CNBC-style CSVs:** `key_pipeline/ingestion/gnews_dxy_extract.py`
+- **CNBC / taxonomy data index:** [data/cnbc_writers_daily/README.md](data/cnbc_writers_daily/README.md)
 
-The GDELT DOC API can be flaky. The ingestion job is designed to retry transient network
-errors and skip a feed if retries still fail, so the workflow keeps running and will
-recover on the next scheduled run. Use the `--fail_on_feed_error` flag if you need the
-job to exit non-zero when a feed fetch fails after retries (default: false). Keep this
-flag disabled in CI to avoid workflow failures from temporary API issues.
+## Legacy ETL (archived)
+
+Yahoo Finance, GDELT, and the old `scripts/` GNews combiner were moved to **`archive/legacy_etl/`**. `make run-etl` still runs those three steps for Docker or historical workflows. GitHub Actions paths were updated to match.
+
+## GDELT / Yahoo (reference)
+
+Incremental backfill and resiliency behavior for GDELT are documented in **`archive/legacy_etl/news_feeds/gdelt/README.md`** (config keys such as `summary.backfill_limit`, `summary.max_hf_new_per_run`, and `--fail_on_feed_error`). The former root paths `news_feeds/gdelt` now live under `archive/legacy_etl/news_feeds/gdelt`.

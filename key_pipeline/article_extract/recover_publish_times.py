@@ -3,7 +3,8 @@ Re-scrape publish times for rows that now have real article URLs
 but are still missing article_published_utc.
 
 This happens because scrape_publish_time.py ran when those rows still
-had news.google.com URLs (before recover_missing_text.py resolved them).
+had news.google.com URLs (before a URL-resolution pass; see
+`archive/legacy_root_scripts/recover_missing_text.py` if you still use that flow).
 
 Reads:  data/apr_jan_pub_ac.csv
 Writes: data/apr_jan_pub_ac.csv  (in-place)
@@ -12,7 +13,11 @@ Writes: data/apr_jan_pub_ac.csv  (in-place)
 
 import pandas as pd
 from tqdm import tqdm
-from scrape_publish_time import build_driver, scrape_article_time, to_utc
+from key_pipeline.article_extract.scrape_publish_time import (
+    build_driver,
+    scrape_article_time,
+    to_utc,
+)
 
 PUB_CSV = "data/aug_mar_ft_pub.csv"
 CLN_CSV = "data/aug_mar_ft_pub_cln.csv"

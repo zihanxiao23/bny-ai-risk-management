@@ -30,7 +30,7 @@ jobs:
       # 4️⃣ Execute the notebook and generate output file
       - name: Execute CounterPartyData.ipynb
         run: |
-          jupyter nbconvert --to notebook --execute CounterPartyData.ipynb --output CounterPartyData_output.ipynb
+          jupyter nbconvert --to notebook --execute archive/notebooks/CounterPartyData.ipynb --output CounterPartyData_output.ipynb
 
       # 5️⃣ Upload executed notebook as an artifact for later download
       - name: Upload executed notebook

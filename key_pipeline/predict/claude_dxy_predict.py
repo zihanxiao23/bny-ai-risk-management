@@ -5,7 +5,7 @@ import pandas as pd
 import json
 from datetime import datetime
 from dotenv import load_dotenv
-from consensus_extract_hf import (
+from key_pipeline.predict.consensus_extract_hf import (
     load_consensus_table,
     lookup_consensus_history,
     build_consensus_context_with_history,

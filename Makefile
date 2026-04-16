@@ -2,6 +2,8 @@
 PYTHON = python3
 PIP = pip3
 IMAGE_NAME = risk-management-bny
+LEGACY_SCRIPTS = archive/legacy_etl/scripts
+LEGACY_NEWS = archive/legacy_etl/news_feeds
 
 # -- Local Development --
 
@@ -10,21 +12,26 @@ install:
 	$(PIP) install -r requirements.txt
 	$(PIP) install --no-deps pygooglenews
 
+.PHONY: run-key-pipeline
+run-key-pipeline:
+	$(PYTHON) key_pipeline/run_key_pipeline.py
+
 .PHONY: run-gnews
 run-gnews:
-	$(PYTHON) scripts/gnews_etl.py
+	$(PYTHON) $(LEGACY_SCRIPTS)/gnews_etl.py
 
 .PHONY: run-yahoo
 run-yahoo:
-	$(PYTHON) scripts/yfinance_etl.py
+	$(PYTHON) $(LEGACY_SCRIPTS)/yfinance_etl.py
 
 .PHONY: run-merge
 run-merge:
-	$(PYTHON) scripts/combine_news.py
+	$(PYTHON) $(LEGACY_SCRIPTS)/combine_news.py
 
+# Legacy Yahoo + GNews + combiner (used by Dockerfile CMD)
 .PHONY: run-etl
-run-all: run-gnews run-yahoo run-merge
-	@echo "All scrapers finished. Check /data folder."
+run-etl: run-gnews run-yahoo run-merge
+	@echo "Legacy ETL finished. Outputs under data/ and $(LEGACY_NEWS)."
 
 .PHONY: clean
 clean:
@@ -38,7 +45,6 @@ docker-build:
 	docker build -t $(IMAGE_NAME) .
 
 # Runs the container and mounts your local 'data' folder
-# so the CSVs appear on your actual laptop, not just inside the container.
 .PHONY: docker-run
 docker-run:
 	docker run --rm -v $(PWD)/data:/app/data $(IMAGE_NAME)
