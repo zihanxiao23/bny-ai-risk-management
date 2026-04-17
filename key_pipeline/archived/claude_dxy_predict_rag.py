@@ -11,6 +11,13 @@ from key_pipeline.predict.consensus_extract_hf import (
     build_consensus_context_with_history,
 )
 
+MACRO_COLUMNS = [
+    "us_2yr_yield",
+    "vix",
+    "cpi_yoy",
+    "dxy_zscore_52w_broad"
+]
+
 # ==============================================================================
 # RAG EMBEDDING BACKEND
 #
@@ -371,39 +378,69 @@ def build_rag_index(examples: list[dict]) -> dict:
         f"{ex['title']}. {ex['content_preview']}"
         for ex in examples
     ]
-    print(f"🔍 Building RAG index for {len(examples)} examples...")
-    embeddings = _embed_texts(texts)   # shape (N, D), L2-normalised
-    print(f"✅ RAG index ready — embedding shape: {embeddings.shape}")
-    return {"embeddings": embeddings, "examples": examples}
 
+    embeddings = _embed_texts(texts)
+
+    # --- NEW: build macro matrix ---
+    macro_matrix = np.array([
+        [ex.get(col, 0.0) for col in MACRO_COLUMNS]
+        for ex in examples
+    ], dtype=np.float32)
+
+    # normalize
+    macro_mean = macro_matrix.mean(axis=0)
+    macro_std = macro_matrix.std(axis=0) + 1e-8
+    macro_matrix = (macro_matrix - macro_mean) / macro_std
+
+    return {
+        "embeddings": embeddings,
+        "examples": examples,
+
+        # --- NEW ---
+        "macro_matrix": macro_matrix,
+        "macro_mean": macro_mean,
+        "macro_std": macro_std,
+    }
+
+def compute_macro_similarity(query_vec, macro_matrix, mean, std):
+    query_vec = np.array(query_vec, dtype=np.float32)
+    query_vec = (query_vec - mean) / std
+
+    dist = np.linalg.norm(macro_matrix - query_vec, axis=1)
+    return -dist
 
 def retrieve_similar_examples(
-    query_title: str,
-    query_content: str,
-    rag_index: dict,
-    k: int = 6,
-    min_similarity: float = 0.25,
-) -> list[tuple[dict, float]]:
-    """
-    Return the top-k most similar GT examples to a new article.
+    title,
+    content,
+    rag_index,
+    query_macro,        # --- NEW ARG ---
+    k=6,
+    alpha=0.7,
+    beta=0.3
+):
+    query_text = f"{title}. {content[:600]}"
+    query_emb = _embed_texts([query_text])[0]
 
-    Cosine similarity (fast dot product because embeddings are L2-normalised).
-    Filters out any results below min_similarity so very distant examples
-    are not forced into the prompt.
+    # semantic similarity (existing)
+    semantic_scores = rag_index["embeddings"] @ query_emb
 
-    Returns list of (example_dict, similarity_score) tuples, best-first.
-    """
-    query_text = f"{query_title}. {query_content[:600]}"
-    query_emb  = _embed_texts([query_text])[0]          # shape (D,)
+    # --- NEW: macro similarity ---
+    macro_scores = compute_macro_similarity(
+        query_macro,
+        rag_index["macro_matrix"],
+        rag_index["macro_mean"],
+        rag_index["macro_std"]
+    )
 
-    scores = rag_index["embeddings"] @ query_emb        # (N,) cosine similarities
-    top_k  = int(min(k, len(rag_index["examples"])))
-    ranked = np.argsort(scores)[::-1][:top_k]
+    # --- NEW: combined score ---
+    final_scores = alpha * semantic_scores + beta * macro_scores
+
+    top_k = min(k, len(rag_index["examples"]))
+    idx = np.argsort(final_scores)[::-1][:top_k]
 
     return [
-        (rag_index["examples"][i], float(scores[i]))
-        for i in ranked
-        if float(scores[i]) >= min_similarity
+        (rag_index["examples"][i], float(final_scores[i]))
+        for i in idx
     ]
 
 
@@ -1403,10 +1440,19 @@ def process_csv_to_csv(
         rag_top_similarity = None
 
         if rag_index is not None:
+            # Build the macro vector aligned with MACRO_COLUMNS (the same
+            # 4-feature schema the index was built from). Missing/NaN macros
+            # default to 0 so the row still retrieves.
+            query_macro_vec = [
+                float(macro_row.get(col, 0.0)) if macro_row.get(col) is not None
+                and not pd.isna(macro_row.get(col)) else 0.0
+                for col in MACRO_COLUMNS
+            ]
             retrieved = retrieve_similar_examples(
-                query_title=title,
-                query_content=content,
+                title=title,
+                content=content,
                 rag_index=rag_index,
+                query_macro=query_macro_vec,
                 k=rag_k,
             )
             rag_few_shot_block = build_rag_few_shot_block(retrieved)
@@ -1515,12 +1561,12 @@ def process_csv_to_csv(
 if __name__ == "__main__":
 
     output_df = process_csv_to_csv(
-        input_csv_path="data/dec_jan_mapped_w_macro.csv",
-        output_csv_path="data/dec_jan_rag_res.csv",
-        ground_truth_csv_path="data/gt_example_ft.csv",
+        input_csv_path="data/aug_mar_cutoff_cln.csv",
+        output_csv_path="data/results_rag.csv",
+        ground_truth_csv_path="data/gt_ext_ft_macros_labeled.csv",
         max_few_shot_examples=42,   # load all 42 — RAG selects the relevant ones
         rag_k=6,                    # retrieve top 6 per article (try 5–8)
         use_rag=True,               # set False to fall back to legacy static few-shot
-        test_row_index=None,        # set to an int to test a single row
+        test_row_index=1,        # set to an int to test a single row
         verbose=True,
     )
